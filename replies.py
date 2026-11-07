@@ -44,7 +44,8 @@ def generate(history):
     messages = [{'role': 'system', 'content': SYSTEM + os.getenv('OWNER_FACTS', '')[:4000]}]
     messages += [{'role': m['role'], 'content': m['content'][-12000:]} for m in history[-20:]]
     payload = json.dumps({'model': model, 'messages': messages, 'max_tokens': 180}).encode()
-    headers = {'Content-Type': 'application/json'}
+    headers = {'Content-Type': 'application/json', 'Accept': 'application/json',
+               'User-Agent': 'primops-reply-bot/1.0'}
     if os.getenv('LLM_API_KEY'):
         headers['Authorization'] = 'Bearer ' + os.environ['LLM_API_KEY']
     try:
