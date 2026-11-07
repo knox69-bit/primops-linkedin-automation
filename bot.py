@@ -15,6 +15,7 @@ from dotenv import load_dotenv, dotenv_values
 from playwright.async_api import async_playwright, expect
 from replies import generate
 from identity import Identity, profile_slug
+from send_attempt import click_once
 
 ROOT = Path(__file__).resolve().parent
 PRIVATE = ROOT / 'private'
@@ -22,6 +23,8 @@ EXTRACT = (ROOT / 'extract.js').read_text(encoding='utf-8')
 SENDER_PROBE = (ROOT / 'sender_probe.js').read_text(encoding='utf-8')
 INVITES = 'https://www.linkedin.com/mynetwork/invitation-manager/'
 INBOX = 'https://www.linkedin.com/messaging/'
+BURST_QUIET_SECONDS = 2.0
+BURST_MAX_SECONDS = 8.0
 
 
 def thread_id(url):
@@ -61,6 +64,7 @@ async def load_thread(page, url):
     async with stage(url, 'navigation'):
         if not thread_id(url):
             raise ValueError('Invalid conversation route')
+        await page.bring_to_front()
         await page.goto(url, wait_until='domcontentloaded')
         await guard(page)
         if thread_id(page.url) != thread_id(url):
@@ -87,7 +91,42 @@ async def read_messages(page, own_slug, url):
         if isinstance(own_slug, Identity):
             for outcome, elapsed in await own_slug.prepare(page):
                 print(f'Thread={digest(url)[:16]} stage=profile_identity outcome={outcome} elapsed_ms={elapsed}', flush=True)
+        await page.bring_to_front()
         return await messages(page, own_slug)
+
+
+async def collect_burst(page, own_slug, url, events):
+    started = changed = time.monotonic()
+    key = event_key(events)
+    while time.monotonic() - started < BURST_MAX_SECONDS:
+        await page.wait_for_timeout(250)
+        fresh = await read_messages(page, own_slug, url)
+        if not fresh:
+            return []
+        current_key = event_key(fresh)
+        if current_key != key:
+            key, changed = current_key, time.monotonic()
+        events = fresh
+        if time.monotonic() - changed >= BURST_QUIET_SECONDS:
+            return events
+    print(f'Thread={digest(url)[:16]} burst=still_arriving; deferred until next sweep.', flush=True)
+    return []
+
+
+def remember_threads(known, discovered):
+    return list(dict.fromkeys([*discovered, *known]))[:40]
+
+
+async def discover_threads(page, known):
+    try:
+        discovered = await thread_links(page)
+    except Exception as exc:
+        print(f'Conversation discovery needs attention: {type(exc).__name__}; retaining {len(known)} known threads.', flush=True)
+        return known
+    retained = remember_threads(known, discovered)
+    if len(retained) > len(discovered):
+        print(f'Conversation discovery: found={len(discovered)} retained={len(retained)}; checking known threads too.', flush=True)
+    return retained
 
 
 def digest(value):
@@ -140,6 +179,7 @@ async def identity_check(page, url, own_slug):
 
 
 async def accept_requests(page):
+    await page.bring_to_front()
     await page.goto(INVITES, wait_until='domcontentloaded')
     await guard(page)
     # Only invitation manager Accept buttons, never Connect, Follow, or invitations sent.
@@ -157,6 +197,7 @@ async def accept_requests(page):
 
 async def thread_links(page):
     # Some LinkedIn inbox layouts use clickable rows without thread <a> links.
+    await page.bring_to_front()
     await page.goto(INBOX, wait_until='domcontentloaded')
     await guard(page)
     try:
@@ -234,22 +275,35 @@ async def handle_thread(page, url, own_slug, state, check=False):
     if row and row[0] == key:
         print('Skipped: latest message already seen/baselined; send a new test message.', flush=True)
         return
-    await page.wait_for_timeout(1000)  # collect rapid consecutive messages
-    fresh = await read_messages(page, own_slug, url)
-    if not fresh or fresh[-1]['role'] != 'user' or any(e['role'] == 'unknown' for e in fresh[-6:]):
-        return
-    events, key = fresh, event_key(fresh)
-    reply = await asyncio.to_thread(generate, [{'role': e['role'], 'content': e['content']} for e in events if e['role'] != 'unknown'])
-    # Don't reply to stale input when another message arrived during AI generation.
-    current = await read_messages(page, own_slug, url)
-    if not current or event_key(current) != key:
+    for attempt in range(2):
+        fresh = await collect_burst(page, own_slug, url, events)
+        if not fresh or fresh[-1]['role'] != 'user' or any(e['role'] == 'unknown' for e in fresh[-6:]):
+            return
+        events, key = fresh, event_key(fresh)
+        async with stage(url, 'generation'):
+            reply = await asyncio.to_thread(generate, [{'role': e['role'], 'content': e['content']} for e in events if e['role'] != 'unknown'])
+        current = await read_messages(page, own_slug, url)
+        if current and event_key(current) == key:
+            if current[-1]['role'] != 'user' or any(e['role'] == 'unknown' for e in current[-6:]):
+                return
+            events = current
+            break
+        if not current:
+            return
+        events = current
+        print(f'Thread={digest(url)[:16]} generation=stale; collecting updated burst.', flush=True)
+    else:
         return
     composer = page.locator('.msg-form__contenteditable[contenteditable=true]')
     if await composer.count() != 1:
         print('Skipped: expected one composer.', flush=True)
         return
     async with stage(url, 'composer'):
-        if (await composer.inner_text()).strip():
+        draft = (await composer.inner_text()).strip()
+        if row and row[2] == 'retry' and draft and digest(draft) == row[1]:
+            await composer.fill('')
+            draft = ''
+        if draft:
             print('Skipped: composer contains an existing draft.', flush=True)
             return
         await composer.fill(reply)
@@ -270,7 +324,11 @@ async def handle_thread(page, url, own_slug, state, check=False):
         return
     state.set(url, row[0] if row else '', digest(reply), 'uncertain')
     async with stage(url, 'send_click'):
-        await send.click()
+        dispatched, error_class = await click_once(page, send)
+    if not dispatched:
+        state.set(url, row[0] if row else '', digest(reply), 'retry')
+        print(f'Thread={digest(url)[:16]} send_dispatch=not_dispatched outcome={error_class}; safe to retry on next sweep.', flush=True)
+        return
     # Confirm a newly visible own message. Never blindly retry a Send click.
     confirmation_started = time.monotonic()
     deadline = confirmation_started + 10
@@ -296,7 +354,31 @@ async def handle_thread(page, url, own_slug, state, check=False):
     print('Send not confirmed. Inspect browser; automatic retry is disabled for this thread.', flush=True)
 
 
+async def review_send(page, url, identity, state):
+    """Resolve an older ambiguous action only with delivery evidence or user review."""
+    row = state.get(url)
+    if not row or row[2] != 'uncertain':
+        print('No uncertain send for this thread; state unchanged.', flush=True)
+        return
+    await load_thread(page, url)
+    events = await read_messages(page, identity, url)
+    if any(e['role'] == 'assistant' and digest(e['content'].strip()) == row[1] for e in events):
+        state.set(url, row[0])
+        print('Previously pending reply is visible as outgoing; hold cleared. Nothing sent.', flush=True)
+        return
+    answer = await asyncio.to_thread(input,
+        'The old click outcome cannot be proven. Check the recipient account first. '
+        'ONLY if that reply was never delivered, type NOT SENT to allow a retry; otherwise press Enter to keep the hold: ')
+    if answer.strip() == 'NOT SENT':
+        state.set(url, row[0], row[1], 'retry')
+        print('Marked retryable after your delivery check. Nothing sent; restart normally to continue.', flush=True)
+    else:
+        print('Uncertain hold kept; nothing sent or changed.', flush=True)
+
+
 async def run(args):
+    if args.review_send and not re.fullmatch(r'[0-9a-f]{16}', args.review_send):
+        raise SystemExit('--review-send requires the 16-character hashed thread ID from the log.')
     file_profile = dotenv_values(ROOT / '.env').get('LINKEDIN_PROFILE_URL')
     load_dotenv(ROOT / '.env')
     effective_profile = os.getenv('LINKEDIN_PROFILE_URL', '')
@@ -325,6 +407,14 @@ async def run(args):
             print('WARNING: AI not configured; replies use limited English fallbacks.', flush=True)
         # Baseline existing threads to avoid replying to old inbox history.
         urls = await thread_links(inbox_page)
+        if args.review_send:
+            matches = [url for url in urls if digest(url)[:16] == args.review_send]
+            if len(matches) == 1:
+                await review_send(thread_page, matches[0], identity, state)
+            else:
+                print('Could not uniquely find that thread in the inbox; no state changed.', flush=True)
+            await context.close()
+            return
         for url in urls:
             try:
                 if args.check:
@@ -342,21 +432,30 @@ async def run(args):
             await context.close()
             return
         print('Running. New incoming messages only. Ctrl+C to stop.', flush=True)
+        browser_lock = asyncio.Lock()
 
         async def invitation_loop():
+            failures = 0
             while True:
                 try:
-                    await accept_requests(invite_page)
+                    async with browser_lock:
+                        await accept_requests(invite_page)
+                    failures = 0
                 except Exception as exc:
+                    failures += 1
                     print(f'Invitation check needs attention: {type(exc).__name__}', flush=True)
-                await asyncio.sleep(max(3, float(os.getenv('POLL_SECONDS', '5'))))
+                await asyncio.sleep(max(30, float(os.getenv('POLL_SECONDS', '5'))) * min(4, 2 ** min(failures, 2)))
 
         async def message_loop():
+            known = urls
             while True:
                 try:
-                    for url in await thread_links(inbox_page):
+                    async with browser_lock:
+                        known = await discover_threads(inbox_page, known)
+                    for url in known:
                         try:
-                            await handle_thread(thread_page, url, identity, state)
+                            async with browser_lock:
+                                await handle_thread(thread_page, url, identity, state)
                         except Exception as exc:
                             print(f'Thread needs attention: {type(exc).__name__}', flush=True)
                     print('Inbox sweep complete.', flush=True)
@@ -374,6 +473,7 @@ if __name__ == '__main__':
     group = parser.add_mutually_exclusive_group()
     group.add_argument('--check', action='store_true', help='Read-only DOM adapter check; sends nothing')
     group.add_argument('--login', action='store_true', help='Only save manual login')
+    group.add_argument('--review-send', metavar='THREAD_HASH', help='Review an old uncertain send; sends nothing and requires explicit delivery confirmation before retry')
     try:
         asyncio.run(run(parser.parse_args()))
     except KeyboardInterrupt:

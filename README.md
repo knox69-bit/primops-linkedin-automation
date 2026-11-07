@@ -23,7 +23,8 @@ Copy-Item .env.example .env
 Edit `.env` with your own LinkedIn profile URL. Configure `LLM_URL`, `LLM_MODEL`,
 and `LLM_API_KEY` using an OpenAI-compatible provider or local server you choose.
 `LLM_URL` must be the complete chat-completions endpoint. The model receives the
-last 20 visible messages (up to 12,000 characters per message), so choose a provider
+up to 20 context messages (up to 12,000 characters each) plus the pending incoming
+burst (up to 24,000 characters), so choose a provider
 you trust. No message content is saved by this application or printed to the console.
 The browser's own local cache may retain content. Without AI, replies use basic
 English templates and will perform poorly on unusual or non-English messages.
@@ -52,17 +53,30 @@ Ctrl+C stops it. No Docker or virtualization is needed.
 
 ## Behavior
 
-- Checks invitations every 5 seconds, plus page load/action time, independently of AI replies.
-- Sweeps up to 40 visible recent inbox threads. Full sweep time depends on thread count.
+- Checks invitations at least 30 seconds apart, backing off after failures.
+  Browser work is serialized so invitation navigation cannot interrupt a reply.
+- Sweeps up to 40 recent discovered threads and retains known URLs when discovery
+  fails or returns a partial list. Full sweep time depends on thread count.
 - Replies only to verified incoming messages; never clicks Connect or starts conversations.
-- Waits briefly for consecutive messages, then checks again after generating a reply.
+- Waits for two seconds without a new event before answering a burst, with an
+  eight-second cap. Sends the whole pending burst as one AI turn. If another
+  message arrives during generation, it recollects and regenerates once in the
+  same sweep. An ongoing burst is deferred without marking it handled.
+- A final "thanks" cannot override earlier questions in the fallback. Provider
+  failures use the full pending burst, and a courtesy-only AI reply to substantive
+  questions is replaced with the full-burst fallback.
+- Uses an 800-token provider completion budget so reasoning does not consume the
+  entire allowance before a visible reply. Final replies remain capped at 800
+  characters. An empty completion falls back to all pending incoming messages.
 - Uses visible conversation context. Doesn't open links, execute message instructions,
   or download/view attachments. Asks for details where needed.
 - Stores hashed thread/event identifiers in `private/state.sqlite3` for restart deduplication.
 - Confirms a visible outgoing reply after clicking Send. An uncertain send is held
   rather than blindly retried. Inspect that thread manually. Once the outgoing
-  message appears, the hold clears. If no message was sent, stop the bot and remove
-  that thread's row from the local SQLite database before restarting.
+  message appears, the hold clears. A failed click can retry automatically only
+  when a document-specific observer proves that no browser input was dispatched.
+  A changed document or any observed activation retains the uncertain hold.
+  Only a matching draft from that retryable attempt can be cleared automatically.
 - Send confirmation compares matching outgoing events before and after Send,
   including event IDs when available, so removal of older rendered history does
   not hide a newly sent reply. An unrelated outgoing message does not clear an
@@ -72,7 +86,20 @@ Ctrl+C stops it. No Docker or virtualization is needed.
   its exact text was not found in the extracted history. Do not clear a hold
   for an already delivered reply just to force another Send.
 - Logs counts/status and exception class names, never message text, names or URLs.
-- Never modifies a composer containing an existing draft.
+- Preserves existing human drafts.
+
+To recover a send held by an older version, stop the bot and use the hashed
+thread ID from its log, for example:
+
+```powershell
+.\.venv\Scripts\python.exe bot.py --review-send 376a866dc08c8a05
+```
+
+The review opens the conversation and sends nothing. A matching visible outgoing
+reply clears the hold automatically. Otherwise check the **recipient account**:
+only if the pending reply was never delivered, type `NOT SENT` at the terminal
+prompt. Press Enter to preserve the hold if unsure. Restart normally afterwards.
+This preserves prior seen-message hashes and never deletes database rows.
 
 ## Limitations and troubleshooting
 
@@ -155,6 +182,13 @@ check, no reply to self, unknown sender refusal, attachment/group extraction,
 uncertain send recovery, two successive incoming turns, delayed Send enablement,
 route mismatch refusal, privacy-safe timeout diagnostics, and fallback output.
 They don't verify LinkedIn's live UI.
+
+Reliability tests also cover timed multi-message questions ending in thanks,
+messages arriving during generation, a long role description followed by a link
+and literal HTML/braces, browser-input dispatch before/after timeouts, loss of
+the document during Send, retained threads after discovery failures, and manual
+review of an older uncertain send. Provider tests cover empty reasoning-budget
+completions and full-burst fallback behavior.
 
 ## Public repository
 

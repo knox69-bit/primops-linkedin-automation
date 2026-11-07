@@ -2,12 +2,54 @@ import os
 import tempfile
 import unittest
 import io
+import json
 from contextlib import redirect_stdout
 from unittest.mock import patch, AsyncMock, MagicMock
-from bot import State, event_key, load_thread
+from bot import State, event_key, load_thread, discover_threads
 from replies import generate
 
 class LogicTests(unittest.TestCase):
+    def test_empty_reasoning_completion_falls_back_to_all_questions(self):
+        response = MagicMock()
+        response.__enter__.return_value = io.StringIO(json.dumps({'choices':[{'finish_reason':'length','message':{'content':None,'reasoning':'private reasoning'}}]}))
+        output = io.StringIO()
+        with patch.dict(os.environ, {'LLM_URL':'https://provider.invalid/chat/completions','LLM_MODEL':'test'}), redirect_stdout(output):
+            with patch('urllib.request.urlopen', return_value=response) as request:
+                reply = generate([{'role':'user','content':'Do you work remotely?'},{'role':'user','content':'Which time zone?'},{'role':'user','content':'thanks!'}])
+        self.assertIn('remote', reply)
+        self.assertIn('time zone', reply)
+        self.assertNotIn('private reasoning', output.getvalue())
+        self.assertEqual(json.loads(request.call_args.args[0].data)['max_tokens'], 800)
+
+    def test_all_pending_questions_survive_provider_failure(self):
+        burst = ['Quick question', 'actually two', 'do you work remotely?', 'and which time zone are you in?', 'thanks!']
+        history = [{'role':'assistant','content':'Previous reply'}] + [{'role':'user','content':text} for text in burst]
+        with patch.dict(os.environ, {'LLM_URL':'https://provider.invalid/chat/completions','LLM_MODEL':'test'}):
+            with patch('urllib.request.urlopen', side_effect=TimeoutError):
+                reply = generate(history)
+        self.assertIn('remote', reply)
+        self.assertIn('time zone', reply)
+        self.assertNotEqual(reply, "You're welcome!")
+
+    def test_ai_receives_one_complete_pending_turn(self):
+        response = MagicMock()
+        response.__enter__.return_value = io.StringIO('{"choices":[{"message":{"content":"Test reply"}}]}')
+        burst = ['Remote work?', 'Which time zone?', 'thanks!']
+        with patch.dict(os.environ, {'LLM_URL':'https://provider.invalid/chat/completions','LLM_MODEL':'test'}):
+            with patch('urllib.request.urlopen', return_value=response) as request:
+                generate([{'role':'user','content':text} for text in burst])
+        messages = json.loads(request.call_args.args[0].data)['messages']
+        self.assertEqual(messages[-1], {'role':'user','content':'\n\n'.join(burst)})
+
+    def test_weak_courtesy_reply_does_not_discard_questions(self):
+        response = MagicMock()
+        response.__enter__.return_value = io.StringIO(json.dumps({'choices':[{'message':{'content':"You're welcome!"}}]}))
+        with patch.dict(os.environ, {'LLM_URL':'https://provider.invalid/chat/completions','LLM_MODEL':'test'}):
+            with patch('urllib.request.urlopen', return_value=response):
+                reply = generate([{'role':'user','content':'Do you work remotely? Which time zone? Thanks!'}])
+        self.assertIn('remote', reply)
+        self.assertIn('time zone', reply)
+
     def test_provider_request_identifies_client_without_exposing_key(self):
         response = MagicMock()
         response.__enter__.return_value = io.StringIO('{"choices":[{"message":{"content":"Test reply"}}]}')
@@ -48,10 +90,18 @@ class LogicTests(unittest.TestCase):
 
 
 class DiagnosticTests(unittest.IsolatedAsyncioTestCase):
+    async def test_discovery_failure_keeps_known_conversations(self):
+        known = ['https://www.linkedin.com/messaging/thread/known/']
+        with patch('bot.thread_links', new_callable=AsyncMock, side_effect=TimeoutError), redirect_stdout(io.StringIO()):
+            self.assertEqual(await discover_threads(None, known), known)
+        with patch('bot.thread_links', new_callable=AsyncMock, return_value=[]), redirect_stdout(io.StringIO()):
+            self.assertEqual(await discover_threads(None, known), known)
+
     async def test_late_render_continues_after_bounded_probe(self):
         page = MagicMock()
         page.url = 'https://www.linkedin.com/messaging/thread/test/'
         page.goto = AsyncMock()
+        page.bring_to_front = AsyncMock()
         page.locator.return_value.first.wait_for = AsyncMock(side_effect=TimeoutError())
         page.locator.return_value.count = AsyncMock(return_value=1)
         page.wait_for_timeout = AsyncMock()
@@ -63,6 +113,7 @@ class DiagnosticTests(unittest.IsolatedAsyncioTestCase):
         page = MagicMock()
         page.url = url
         page.goto = AsyncMock()
+        page.bring_to_front = AsyncMock()
         page.locator.return_value.first.wait_for = AsyncMock(side_effect=TimeoutError('secret message and name'))
         page.locator.return_value.count = AsyncMock(return_value=0)
         page.wait_for_timeout = AsyncMock()
